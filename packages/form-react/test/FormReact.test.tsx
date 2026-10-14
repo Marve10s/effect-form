@@ -1,4 +1,4 @@
-import { useAtomSet, useAtomSubscribe, useAtomValue } from "@effect/atom-react"
+import { RegistryContext, useAtomSet, useAtomSubscribe, useAtomValue } from "@effect/atom-react"
 import { Field, FormBuilder, FormReact } from "@lucas-barake/effect-form-react"
 import { render, screen, waitFor } from "@testing-library/react"
 import { userEvent } from "@testing-library/user-event"
@@ -55,6 +55,44 @@ describe("FormReact.make", () => {
       )
 
       expect(screen.getByTestId("text-input")).toHaveValue("John")
+    })
+
+    it("does not show a previous visit's validation error after remounting in the same registry", async () => {
+      const SlugField = Field.makeField("slug", Schema.String.pipe(Schema.check(Schema.isNonEmpty())))
+      const form = FormReact.make(FormBuilder.empty.addField(SlugField), {
+        fields: { slug: TextInput },
+        onSubmit: () => {}
+      })
+      const SubmitButton = makeSubmitButton(form.submit, undefined)
+      const registry = AtomRegistry.make()
+      const Page = () => (
+        <RegistryContext.Provider value={registry}>
+          <form.Initialize defaultValues={{ slug: "" }}>
+            <form.slug />
+            <SubmitButton />
+          </form.Initialize>
+        </RegistryContext.Provider>
+      )
+      const user = userEvent.setup()
+
+      const firstVisit = render(<Page />)
+      await user.click(screen.getByTestId("submit"))
+      await waitFor(() =>
+        expect(screen.getByTestId("error")).toHaveTextContent("Expected a value with a length of at least 1")
+      )
+      await user.type(screen.getByTestId("text-input"), "a")
+      await user.clear(screen.getByTestId("text-input"))
+      await user.type(screen.getByTestId("text-input"), "abc")
+      await user.click(screen.getByTestId("submit"))
+      await waitFor(() => expect(screen.queryByTestId("error")).not.toBeInTheDocument())
+      firstVisit.unmount()
+
+      render(<Page />)
+      await user.type(screen.getByTestId("text-input"), "my-slug")
+      await user.click(screen.getByTestId("submit"))
+
+      await waitFor(() => expect(registry.get(form.submitCount)).toBe(1))
+      expect(screen.queryByTestId("error")).not.toBeInTheDocument()
     })
   })
 
@@ -2345,6 +2383,20 @@ describe("FormReact.make", () => {
       expectTypeOf(form.submit).not.toBeAny()
       expectTypeOf(form.Initialize).not.toBeAny()
     })
+
+    it("types the submit error as SchemaError when onSubmit does not return an Effect", () => {
+      const formBuilder = FormBuilder.empty.addField(Field.makeField("name", Schema.String))
+
+      const syncForm = FormReact.make(formBuilder, { fields: { name: TextInput }, onSubmit: () => 1 })
+      const promiseForm = FormReact.make(formBuilder, {
+        runtime: Atom.runtime(Layer.empty),
+        fields: { name: TextInput },
+        onSubmit: () => Promise.resolve("saved")
+      })
+
+      expectTypeOf(syncForm.submit).toEqualTypeOf<Atom.AtomResultFn<void, number, Schema.SchemaError>>()
+      expectTypeOf(promiseForm.submit).toEqualTypeOf<Atom.AtomResultFn<void, string, Schema.SchemaError>>()
+    })
   })
 
   describe("debounce and auto-submit", () => {
@@ -2440,6 +2492,37 @@ describe("FormReact.make", () => {
       await delay(120)
 
       expect(submitHandler).not.toHaveBeenCalled()
+    })
+
+    it("does NOT auto-submit the default values when remounting in the same registry", async () => {
+      const user = userEvent.setup()
+      const submitHandler = vi.fn()
+
+      const form = FormReact.make(FormBuilder.empty.addField(NameField), {
+        runtime: createRuntime(),
+        fields: { name: DebounceTextInput },
+        mode: { validation: "onChange", autoSubmit: true },
+        onSubmit: (_: void, { decoded }) => submitHandler(decoded)
+      })
+      const registry = AtomRegistry.make()
+      const Page = () => (
+        <RegistryContext.Provider value={registry}>
+          <form.Initialize defaultValues={{ name: "Initial" }}>
+            <form.name />
+          </form.Initialize>
+        </RegistryContext.Provider>
+      )
+
+      const firstVisit = render(<Page />)
+      await user.type(screen.getByTestId("text-input"), "!")
+      await waitFor(() => expect(submitHandler).toHaveBeenLastCalledWith({ name: "Initial!" }))
+      const submitsBeforeLeaving = submitHandler.mock.calls.length
+      firstVisit.unmount()
+
+      render(<Page />)
+      await delay(50)
+
+      expect(submitHandler).toHaveBeenCalledTimes(submitsBeforeLeaving)
     })
 
     it("auto-submits valid form data after debounce", async () => {

@@ -348,7 +348,7 @@ export const make: {
     TFields extends Field.FieldsRecord,
     R extends AtomRegistry.AtomRegistry,
     A,
-    E,
+    E = never,
     SubmitArgs = void,
     CM extends FieldComponentMap<TFields> = FieldComponentMap<TFields>,
   >(
@@ -365,7 +365,7 @@ export const make: {
           readonly encoded: Field.EncodedFromFields<TFields>
           readonly get: Atom.FnContext
         }
-      ) => A | Effect.Effect<A, E, R>
+      ) => A | PromiseLike<A> | Effect.Effect<A, E, R>
     }
   ): BuiltForm<TFields, R, A, E, SubmitArgs, CM>
 
@@ -373,7 +373,7 @@ export const make: {
     TFields extends Field.FieldsRecord,
     R,
     A,
-    E,
+    E = never,
     SubmitArgs = void,
     ER = never,
     CM extends FieldComponentMap<TFields> = FieldComponentMap<TFields>,
@@ -391,7 +391,7 @@ export const make: {
           readonly encoded: Field.EncodedFromFields<TFields>
           readonly get: Atom.FnContext
         }
-      ) => A | Effect.Effect<A, E, R>
+      ) => A | PromiseLike<A> | Effect.Effect<A, E, R>
     }
   ): BuiltForm<TFields, R, A, E, SubmitArgs, CM>
 } = (self: any, options: any): any => {
@@ -414,6 +414,7 @@ export const make: {
     getFieldAtoms,
     getOrCreateFieldAtoms,
     hasChangedSinceSubmitAtom,
+    initializeAtom,
     isDirtyAtom,
     keepAliveActiveAtom,
     lastSubmittedValuesAtom,
@@ -439,14 +440,14 @@ export const make: {
   }> = (props) => {
     const registry = useContext(RegistryContext)
     const state = useAtomValue(() => stateAtom)
-    const setFormState = useAtomSet(() => stateAtom)
+    const initialize = useAtomSet(() => initializeAtom)
     const triggerValidate = useAtomSet(() => validateAtom)
     const [isInitialized, setIsInitialized] = createSignal(false)
 
     onMount(() => {
       const shouldInit = !registry.get(keepAliveActiveAtom) || Option.isNone(registry.get(stateAtom))
       if (shouldInit) {
-        setFormState(Option.some(operations.createInitialState(props.defaultValues)))
+        initialize(props.defaultValues)
         if (props.validateOnInit) {
           triggerValidate()
         }

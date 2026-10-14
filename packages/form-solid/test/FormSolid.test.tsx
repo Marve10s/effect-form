@@ -1,11 +1,12 @@
-import { useAtomSet, useAtomSubscribe } from "@effect/atom-solid"
+import { RegistryContext, useAtomSet, useAtomSubscribe } from "@effect/atom-solid"
 import { Field, FormBuilder, FormSolid } from "@lucas-barake/effect-form-solid"
 import { render, screen, waitFor } from "@solidjs/testing-library"
 import { userEvent } from "@testing-library/user-event"
 import * as Option from "effect/Option"
 import type * as Atom from "effect/reactivity/Atom"
+import * as AtomRegistry from "effect/reactivity/AtomRegistry"
 import * as Schema from "effect/Schema"
-import { describe, expect, it, vi } from "vitest"
+import { describe, expect, expectTypeOf, it, vi } from "vitest"
 
 const TextInput: FormSolid.FieldComponent<string> = ({ field }) => (
   <div>
@@ -46,6 +47,89 @@ describe("FormSolid.make", () => {
       ))
 
       expect(screen.getByTestId("text-input")).toHaveValue("John")
+    })
+
+    it("types the submit error as SchemaError when onSubmit does not return an Effect", () => {
+      const formBuilder = FormBuilder.empty.addField(Field.makeField("name", Schema.String))
+
+      const syncForm = FormSolid.make(formBuilder, { fields: { name: TextInput }, onSubmit: () => 1 })
+      const promiseForm = FormSolid.make(formBuilder, {
+        fields: { name: TextInput },
+        onSubmit: () => Promise.resolve("saved")
+      })
+
+      expectTypeOf(syncForm.submit).toEqualTypeOf<Atom.AtomResultFn<void, number, Schema.SchemaError>>()
+      expectTypeOf(promiseForm.submit).toEqualTypeOf<Atom.AtomResultFn<void, string, Schema.SchemaError>>()
+    })
+
+    it("does not show a previous visit's validation error after remounting in the same registry", async () => {
+      const SlugField = Field.makeField("slug", Schema.String.pipe(Schema.check(Schema.isNonEmpty())))
+      const form = FormSolid.make(FormBuilder.empty.addField(SlugField), {
+        fields: { slug: TextInput },
+        onSubmit: () => {}
+      })
+      const SubmitButton = makeSubmitButton(form.submit, undefined)
+      const registry = AtomRegistry.make()
+      const Page = () => (
+        <RegistryContext.Provider value={registry}>
+          <form.Initialize defaultValues={{ slug: "" }}>
+            <form.slug />
+            <SubmitButton />
+          </form.Initialize>
+        </RegistryContext.Provider>
+      )
+      const user = userEvent.setup()
+
+      const firstVisit = render(() => <Page />)
+      await user.click(screen.getByTestId("submit"))
+      await waitFor(() =>
+        expect(screen.getByTestId("error")).toHaveTextContent("Expected a value with a length of at least 1")
+      )
+      await user.type(screen.getByTestId("text-input"), "a")
+      await user.clear(screen.getByTestId("text-input"))
+      await user.type(screen.getByTestId("text-input"), "abc")
+      await user.click(screen.getByTestId("submit"))
+      await waitFor(() => expect(screen.queryByTestId("error")).not.toBeInTheDocument())
+      firstVisit.unmount()
+
+      render(() => <Page />)
+      await user.type(screen.getByTestId("text-input"), "my-slug")
+      await user.click(screen.getByTestId("submit"))
+
+      await waitFor(() => expect(registry.get(form.submitCount)).toBe(1))
+      expect(screen.queryByTestId("error")).not.toBeInTheDocument()
+    })
+  })
+
+  describe("auto-submit", () => {
+    it("does NOT auto-submit the default values when remounting in the same registry", async () => {
+      const user = userEvent.setup()
+      const submitHandler = vi.fn()
+
+      const form = FormSolid.make(FormBuilder.empty.addField(Field.makeField("name", Schema.String)), {
+        fields: { name: TextInput },
+        mode: { validation: "onChange", autoSubmit: true },
+        onSubmit: (_: void, { decoded }) => submitHandler(decoded)
+      })
+      const registry = AtomRegistry.make()
+      const Page = () => (
+        <RegistryContext.Provider value={registry}>
+          <form.Initialize defaultValues={{ name: "Initial" }}>
+            <form.name />
+          </form.Initialize>
+        </RegistryContext.Provider>
+      )
+
+      const firstVisit = render(() => <Page />)
+      await user.type(screen.getByTestId("text-input"), "!")
+      await waitFor(() => expect(submitHandler).toHaveBeenLastCalledWith({ name: "Initial!" }))
+      const submitsBeforeLeaving = submitHandler.mock.calls.length
+      firstVisit.unmount()
+
+      render(() => <Page />)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(submitHandler).toHaveBeenCalledTimes(submitsBeforeLeaving)
     })
   })
 

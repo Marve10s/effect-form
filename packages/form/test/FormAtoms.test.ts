@@ -3,11 +3,12 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
 import * as Atom from "effect/reactivity/Atom"
 import * as AtomRegistry from "effect/reactivity/AtomRegistry"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest"
 import * as Field from "../src/Field.js"
 import * as FormAtoms from "../src/FormAtoms.js"
 import * as FormBuilder from "../src/FormBuilder.js"
@@ -854,6 +855,104 @@ describe("FormAtoms", () => {
       const after = atoms.getFieldAtoms(atoms.fieldRefs.name)
 
       expect(before).toBe(after)
+    })
+  })
+
+  describe("stateAtom", () => {
+    it("submits a form whose state was seeded through registry initialValues", async () => {
+      const onSubmit = vi.fn()
+      const atoms = FormAtoms.make({ runtime: Atom.runtime(Layer.empty), formBuilder: makeTestForm(), onSubmit })
+      const initialState = Option.some(atoms.operations.createInitialState({ name: "John", email: "j@x.io" }))
+      const registry = AtomRegistry.make({ initialValues: [[atoms.stateAtom, initialState]] })
+      registry.mount(atoms.stateAtom)
+      registry.mount(atoms.submitAtom)
+
+      registry.set(atoms.submitAtom, undefined)
+      await vi.waitFor(() => expect(AsyncResult.isWaiting(registry.get(atoms.submitAtom))).toBe(false))
+
+      expect(AsyncResult.isSuccess(registry.get(atoms.submitAtom))).toBe(true)
+      expect(onSubmit).toHaveBeenCalledTimes(1)
+      expect(Option.getOrThrow(registry.get(atoms.stateAtom)).submitCount).toBe(1)
+    })
+
+    it("validates a form whose state was seeded through registry initialValues", async () => {
+      const atoms = FormAtoms.make({
+        runtime: Atom.runtime(Layer.empty),
+        formBuilder: makeTestForm(),
+        onSubmit: () => {}
+      })
+      const initialState = Option.some(atoms.operations.createInitialState({ name: "John", email: "j@x.io" }))
+      const registry = AtomRegistry.make({ initialValues: [[atoms.stateAtom, initialState]] })
+      registry.mount(atoms.stateAtom)
+      registry.mount(atoms.validateAtom)
+
+      registry.set(atoms.validateAtom, undefined)
+      await vi.waitFor(() => expect(AsyncResult.isWaiting(registry.get(atoms.validateAtom))).toBe(false))
+
+      expect(Option.getOrThrow(registry.get(atoms.stateAtom)).validationCount).toBe(1)
+    })
+
+    it("notifies a subscriber registered before the first read when stateAtom is written", () => {
+      const atoms = FormAtoms.make({
+        runtime: Atom.runtime(Layer.empty),
+        formBuilder: makeTestForm(),
+        onSubmit: () => {}
+      })
+      const registry = AtomRegistry.make()
+      const seen: Array<unknown> = []
+      registry.subscribe(atoms.stateAtom, (state) => seen.push(state))
+
+      const initialState = Option.some(atoms.operations.createInitialState({ name: "John", email: "j@x.io" }))
+      registry.set(atoms.stateAtom, initialState)
+
+      expect(seen).toEqual([initialState])
+    })
+
+    it("notifies a subscriber registered before the first read when the form is initialized", () => {
+      const atoms = FormAtoms.make({
+        runtime: Atom.runtime(Layer.empty),
+        formBuilder: makeTestForm(),
+        onSubmit: () => {}
+      })
+      const registry = AtomRegistry.make()
+      const seenValues: Array<unknown> = []
+      registry.subscribe(atoms.stateAtom, (state) => seenValues.push(Option.map(state, (s) => s.values)))
+
+      registry.set(atoms.initializeAtom, { name: "Jane", email: "j@x.io" })
+
+      expect(seenValues).toEqual([Option.some({ name: "Jane", email: "j@x.io" })])
+    })
+
+    it("initializes a form whose state was seeded through registry initialValues and not read yet", () => {
+      const atoms = FormAtoms.make({
+        runtime: Atom.runtime(Layer.empty),
+        formBuilder: makeTestForm(),
+        onSubmit: () => {}
+      })
+      const seeded = Option.some(atoms.operations.createInitialState({ name: "Seed", email: "s@x.io" }))
+      const registry = AtomRegistry.make({ initialValues: [[atoms.stateAtom, seeded]] })
+
+      registry.set(atoms.initializeAtom, { name: "Jane", email: "j@x.io" })
+
+      expect(Option.map(registry.get(atoms.stateAtom), (s) => s.values)).toEqual(
+        Option.some({ name: "Jane", email: "j@x.io" })
+      )
+    })
+
+    it("keeps a write to a seeded stateAtom made before its first read", () => {
+      const atoms = FormAtoms.make({
+        runtime: Atom.runtime(Layer.empty),
+        formBuilder: makeTestForm(),
+        onSubmit: () => {}
+      })
+      const seeded = Option.some(atoms.operations.createInitialState({ name: "Seed", email: "s@x.io" }))
+      const registry = AtomRegistry.make({ initialValues: [[atoms.stateAtom, seeded]] })
+
+      registry.set(atoms.stateAtom, Option.some(atoms.operations.createInitialState({ name: "Jane", email: "j@x.io" })))
+
+      expect(Option.map(registry.get(atoms.stateAtom), (s) => s.values)).toEqual(
+        Option.some({ name: "Jane", email: "j@x.io" })
+      )
     })
   })
 
@@ -1795,6 +1894,164 @@ describe("FormAtoms", () => {
       expect(finalValues).toEqual({ name: "V1" })
     })
 
+    it("types the submit error as SchemaError when onSubmit returns a plain value", () => {
+      const runtime = Atom.runtime(Layer.empty)
+      const atoms = FormAtoms.make({ runtime, formBuilder: makeTestForm(), onSubmit: () => 1 })
+      expectTypeOf(atoms.submitAtom).toEqualTypeOf<Atom.AtomResultFn<void, number, Schema.SchemaError>>()
+    })
+
+    describe("when the form is re-initialized while a submit is in flight", () => {
+      const makeGatedDecodeForm = () => {
+        let settleDecode: ((issue: string | undefined) => void) | undefined
+        const NameField = Field.makeField(
+          "name",
+          Schema.String.pipe(
+            Schema.decode({
+              decode: SchemaGetter.checkEffect((_v: string) =>
+                Effect.callback<string | undefined, never>((resume) => {
+                  settleDecode = (issue) => resume(Effect.succeed(issue))
+                })
+              ),
+              encode: SchemaGetter.passthrough()
+            })
+          )
+        )
+        return {
+          form: FormBuilder.empty.addField(NameField),
+          settleDecode: (issue: string | undefined) => settleDecode?.(issue)
+        }
+      }
+
+      const waitForSubmit = (
+        registry: AtomRegistry.AtomRegistry,
+        submitAtom: Atom.Atom<AsyncResult.AsyncResult<any, any>>
+      ) =>
+        vi.waitFor(() => {
+          const current = registry.get(submitAtom)
+          if (AsyncResult.isInitial(current) || current.waiting) throw new Error("submit still running")
+          return current
+        })
+
+      it("does not record the previous values as last submitted when onSubmit finishes afterwards", async () => {
+        let finishSubmit: (() => void) | undefined
+        const atoms = FormAtoms.make({
+          runtime: Atom.runtime(Layer.empty),
+          formBuilder: makeTestForm(),
+          onSubmit: () =>
+            Effect.callback<void>((resume) => {
+              finishSubmit = () => resume(Effect.void)
+            })
+        })
+        const registry = AtomRegistry.make()
+        registry.mount(atoms.stateAtom)
+        registry.mount(atoms.submitAtom)
+        registry.mount(atoms.hasChangedSinceSubmitAtom)
+
+        registry.set(atoms.initializeAtom, { name: "Old", email: "old@x.io" })
+        registry.set(atoms.submitAtom, undefined)
+        await vi.waitFor(() => expect(finishSubmit).toBeDefined())
+
+        registry.set(atoms.initializeAtom, { name: "New", email: "new@x.io" })
+        finishSubmit?.()
+        const result = await waitForSubmit(registry, atoms.submitAtom)
+
+        expect(AsyncResult.isSuccess(result)).toBe(true)
+        const state = Option.getOrThrow(registry.get(atoms.stateAtom))
+        expect(state.values).toEqual({ name: "New", email: "new@x.io" })
+        expect(Option.isNone(state.lastSubmittedValues)).toBe(true)
+        expect(registry.get(atoms.hasChangedSinceSubmitAtom)).toBe(false)
+      })
+
+      it("does not count the submit against the new session when decoding succeeds afterwards", async () => {
+        const { form, settleDecode } = makeGatedDecodeForm()
+        const onSubmit = vi.fn()
+        const atoms = FormAtoms.make({ runtime: Atom.runtime(Layer.empty), formBuilder: form, onSubmit })
+        const registry = AtomRegistry.make()
+        registry.mount(atoms.stateAtom)
+        registry.mount(atoms.submitAtom)
+
+        registry.set(atoms.initializeAtom, { name: "Old" })
+        registry.set(atoms.submitAtom, undefined)
+        registry.set(atoms.initializeAtom, { name: "New" })
+        settleDecode(undefined)
+        await waitForSubmit(registry, atoms.submitAtom)
+
+        const state = Option.getOrThrow(registry.get(atoms.stateAtom))
+        expect(state.submitCount).toBe(0)
+        expect(state.touched).toEqual({ name: false })
+        expect(Option.isNone(state.lastSubmittedValues)).toBe(true)
+      })
+
+      it("does not write the previous values' errors into the new session when decoding fails afterwards", async () => {
+        const { form, settleDecode } = makeGatedDecodeForm()
+        const atoms = FormAtoms.make({ runtime: Atom.runtime(Layer.empty), formBuilder: form, onSubmit: () => {} })
+        const registry = AtomRegistry.make()
+        registry.mount(atoms.stateAtom)
+        registry.mount(atoms.errorsAtom)
+        registry.mount(atoms.submitAtom)
+
+        registry.set(atoms.initializeAtom, { name: "Old" })
+        registry.set(atoms.submitAtom, undefined)
+        registry.set(atoms.initializeAtom, { name: "New" })
+        settleDecode("Name is taken")
+        const result = await waitForSubmit(registry, atoms.submitAtom)
+
+        expect(AsyncResult.isFailure(result)).toBe(true)
+        expect(registry.get(atoms.errorsAtom).size).toBe(0)
+        expect(Option.getOrThrow(registry.get(atoms.stateAtom)).submitCount).toBe(0)
+      })
+
+      it("does not write the previous values' validation errors into the new session", async () => {
+        const { form, settleDecode } = makeGatedDecodeForm()
+        const atoms = FormAtoms.make({ runtime: Atom.runtime(Layer.empty), formBuilder: form, onSubmit: () => {} })
+        const registry = AtomRegistry.make()
+        registry.mount(atoms.stateAtom)
+        registry.mount(atoms.errorsAtom)
+        registry.mount(atoms.validateAtom)
+
+        registry.set(atoms.initializeAtom, { name: "Old" })
+        registry.set(atoms.validateAtom, undefined)
+        registry.set(atoms.initializeAtom, { name: "New" })
+        settleDecode("Name is taken")
+        await waitForSubmit(registry, atoms.validateAtom)
+
+        expect(registry.get(atoms.errorsAtom).size).toBe(0)
+        expect(Option.getOrThrow(registry.get(atoms.stateAtom)).validationCount).toBe(0)
+      })
+
+      it("still records a validation that started right after initialization and settles later", async () => {
+        const { form, settleDecode } = makeGatedDecodeForm()
+        const atoms = FormAtoms.make({ runtime: Atom.runtime(Layer.empty), formBuilder: form, onSubmit: () => {} })
+        const registry = AtomRegistry.make()
+        registry.mount(atoms.stateAtom)
+        registry.mount(atoms.validateAtom)
+
+        registry.set(atoms.initializeAtom, { name: "Jane" })
+        registry.set(atoms.validateAtom, undefined)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        settleDecode(undefined)
+        await waitForSubmit(registry, atoms.validateAtom)
+
+        expect(Option.getOrThrow(registry.get(atoms.stateAtom)).validationCount).toBe(1)
+      })
+
+      it("does not count a validation of the previous values against the new session", async () => {
+        const { form, settleDecode } = makeGatedDecodeForm()
+        const atoms = FormAtoms.make({ runtime: Atom.runtime(Layer.empty), formBuilder: form, onSubmit: () => {} })
+        const registry = AtomRegistry.make()
+        registry.mount(atoms.stateAtom)
+        registry.mount(atoms.validateAtom)
+
+        registry.set(atoms.initializeAtom, { name: "Old" })
+        registry.set(atoms.validateAtom, undefined)
+        registry.set(atoms.initializeAtom, { name: "New" })
+        settleDecode(undefined)
+        await waitForSubmit(registry, atoms.validateAtom)
+
+        expect(Option.getOrThrow(registry.get(atoms.stateAtom)).validationCount).toBe(0)
+      })
+    })
+
     it("does not record lastSubmittedValues when onSubmit itself fails", async () => {
       const runtime = Atom.runtime(Layer.empty)
       const EmailField = Field.makeField(
@@ -1821,6 +2078,65 @@ describe("FormAtoms", () => {
       const stateAfter = registry.get(atoms.stateAtom).pipe(Option.getOrThrow)
       expect(Option.isNone(stateAfter.lastSubmittedValues)).toBe(true)
       expect(Option.isNone(registry.get(atoms.lastSubmittedValuesAtom))).toBe(true)
+    })
+
+    it("fails and does not record lastSubmittedValues when onSubmit returns a rejected Promise", async () => {
+      const runtime = Atom.runtime(Layer.empty)
+      const form = makeTestForm()
+      const rejection = new Error("409 Conflict")
+      const atoms = FormAtoms.make({
+        runtime,
+        formBuilder: form,
+        onSubmit: () => Promise.reject(rejection)
+      })
+      const registry = AtomRegistry.make()
+
+      registry.set(atoms.stateAtom, Option.some(atoms.operations.createInitialState({ name: "John", email: "j@x.io" })))
+      registry.mount(atoms.stateAtom)
+      registry.mount(atoms.lastSubmittedValuesAtom)
+      registry.mount(atoms.submitAtom)
+      registry.set(atoms.submitAtom, undefined)
+
+      const result = await vi.waitFor(() => {
+        const current = registry.get(atoms.submitAtom)
+        if (AsyncResult.isInitial(current) || current.waiting) throw new Error("submit still running")
+        return current
+      })
+
+      expect(AsyncResult.isFailure(result)).toBe(true)
+      if (AsyncResult.isFailure(result)) {
+        expect(Cause.squash(result.cause)).toBe(rejection)
+      }
+      expect(Option.isNone(registry.get(atoms.lastSubmittedValuesAtom))).toBe(true)
+    })
+
+    it("succeeds with the resolved value when onSubmit returns a Promise", async () => {
+      const runtime = Atom.runtime(Layer.empty)
+      const form = makeTestForm()
+      const atoms = FormAtoms.make({
+        runtime,
+        formBuilder: form,
+        onSubmit: (_: void, { decoded }) => Promise.resolve({ savedName: decoded.name })
+      })
+      expectTypeOf(atoms.submitAtom).toEqualTypeOf<
+        Atom.AtomResultFn<void, { savedName: string }, Schema.SchemaError>
+      >()
+      const registry = AtomRegistry.make()
+
+      registry.set(atoms.stateAtom, Option.some(atoms.operations.createInitialState({ name: "John", email: "j@x.io" })))
+      registry.mount(atoms.stateAtom)
+      registry.mount(atoms.lastSubmittedValuesAtom)
+      registry.mount(atoms.submitAtom)
+      registry.set(atoms.submitAtom, undefined)
+
+      const result = await vi.waitFor(() => {
+        const current = registry.get(atoms.submitAtom)
+        if (AsyncResult.isInitial(current) || current.waiting) throw new Error("submit still running")
+        return current
+      })
+
+      expect(AsyncResult.isSuccess(result) && result.value).toEqual({ savedName: "John" })
+      expect(Option.isSome(registry.get(atoms.lastSubmittedValuesAtom))).toBe(true)
     })
   })
 
@@ -2659,6 +2975,33 @@ describe("FormAtoms", () => {
       vi.useRealTimers()
     })
 
+    it("does not submit the re-initialized defaults when a debounce from before initialization lands", async () => {
+      const runtime = Atom.runtime(Layer.empty)
+      const form = makeTestForm()
+      const onSubmit = vi.fn()
+      const atoms = FormAtoms.make({
+        runtime,
+        formBuilder: form,
+        onSubmit,
+        mode: { validation: "onChange", debounce: "300 millis", autoSubmit: true }
+      })
+      const registry = AtomRegistry.make()
+
+      registry.set(atoms.initializeAtom, { name: "John", email: "test@test.com" })
+      registry.mount(atoms.autoSubmitAtom)
+      registry.mount(atoms.submitAtom)
+      registry.mount(atoms.stateAtom)
+
+      const state = Option.getOrThrow(registry.get(atoms.stateAtom))
+      registry.set(atoms.stateAtom, Option.some(atoms.operations.setFieldValue(state, "name", "Jane")))
+      await vi.advanceTimersByTimeAsync(100)
+
+      registry.set(atoms.initializeAtom, { name: "Other", email: "other@test.com" })
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(onSubmit).not.toHaveBeenCalled()
+    })
+
     it("triggers submit when values change in onChange auto-submit mode", async () => {
       const runtime = Atom.runtime(Layer.empty)
       const form = makeTestForm()
@@ -2723,6 +3066,45 @@ describe("FormAtoms", () => {
       resolveSubmit!()
       await vi.advanceTimersByTimeAsync(0)
       expect(completions).toHaveBeenCalledTimes(1)
+    })
+
+    it("submits an edit made after re-initialization while an earlier submit is still in flight", async () => {
+      const runtime = Atom.runtime(Layer.empty)
+      const form = makeTestForm()
+      const submittedNames: Array<string> = []
+      const resolvers: Array<() => void> = []
+      const onSubmit = vi.fn((_args: void, ctx: { readonly encoded: { readonly name: string } }) =>
+        Effect.callback<void, never>((resume) => {
+          submittedNames.push(ctx.encoded.name)
+          resolvers.push(() => resume(Effect.void))
+        })
+      )
+      const atoms = FormAtoms.make({
+        runtime,
+        formBuilder: form,
+        onSubmit,
+        mode: { validation: "onChange", autoSubmit: true }
+      })
+      const registry = AtomRegistry.make()
+
+      registry.set(atoms.initializeAtom, { name: "a", email: "e@e.com" })
+      registry.mount(atoms.autoSubmitAtom)
+      registry.mount(atoms.submitAtom)
+      registry.mount(atoms.stateAtom)
+
+      const state0 = Option.getOrThrow(registry.get(atoms.stateAtom))
+      registry.set(atoms.stateAtom, Option.some(atoms.operations.setFieldValue(state0, "name", "b")))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(submittedNames).toEqual(["b"])
+
+      registry.set(atoms.initializeAtom, { name: "x", email: "e@e.com" })
+      const fresh = Option.getOrThrow(registry.get(atoms.stateAtom))
+      registry.set(atoms.stateAtom, Option.some(atoms.operations.setFieldValue(fresh, "name", "y")))
+
+      resolvers[0]()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(submittedNames).toEqual(["b", "y"])
     })
 
     it("does not lose a change made during a follow-up auto-submit (no debounce)", async () => {

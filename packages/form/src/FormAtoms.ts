@@ -2,6 +2,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import { pipe } from "effect/Function"
 import * as Option from "effect/Option"
+import * as Predicate from "effect/Predicate"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import * as Atom from "effect/reactivity/Atom"
 import * as Schema from "effect/Schema"
@@ -48,7 +49,7 @@ export interface FormAtomsConfig<TFields extends Field.FieldsRecord, R, A, E, Su
       readonly encoded: Field.EncodedFromFields<TFields>
       readonly get: Atom.FnContext
     }
-  ) => A | Effect.Effect<A, E, R>
+  ) => A | PromiseLike<A> | Effect.Effect<A, E, R>
 }
 
 export type FieldRefs<TFields extends Field.FieldsRecord,> = {
@@ -93,6 +94,7 @@ export interface FormAtoms<TFields extends Field.FieldsRecord, R, A = void, E = 
 
   readonly operations: FormOperations<TFields>
 
+  readonly initializeAtom: Atom.Writable<void, Field.EncodedFromFields<TFields>>
   readonly resetAtom: Atom.Writable<void, void>
   readonly revertToLastSubmitAtom: Atom.Writable<void, void>
   readonly setValuesAtom: Atom.Writable<Field.EncodedFromFields<TFields>>
@@ -194,7 +196,7 @@ const getStateOrThrow = <TFields extends Field.FieldsRecord,>(
   return state.value
 }
 
-export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = void,>(
+export const make = <TFields extends Field.FieldsRecord, R, A, E = never, SubmitArgs = void,>(
   config: FormAtomsConfig<TFields, R, A, E, SubmitArgs>
 ): FormAtoms<TFields, R, A, E, SubmitArgs> => {
   const { formBuilder, runtime } = config
@@ -214,6 +216,22 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
   const combinedSchema = FormBuilder.buildSchema(formBuilder)
 
   const stateAtom = Atom.make(Option.none<FormBuilder.FormState<TFields>>()).pipe(Atom.setIdleTTL(0))
+
+  // Every initialization stores a new, never reused id, so work started before
+  // it (an in-flight submit or validate, an auto-submit build) can tell that the
+  // form was initialized again. The id lives outside stateAtom so that state
+  // keeps its plain writable semantics.
+  let lastSessionId = 0
+  const sessionIdAtom = Atom.make(0).pipe(Atom.setIdleTTL(0))
+
+  // Mounting keeps the id node alive for the lifetime of the calling fn atom.
+  // Otherwise it could be swept mid-flight and come back at its initial 0.
+  const captureSession = (get: Atom.FnContext) => {
+    get.mount(sessionIdAtom)
+    const sessionId = get(sessionIdAtom)
+    return () => get(sessionIdAtom) === sessionId
+  }
+
   const errorsAtom = Atom.make<Map<string, Validation.ErrorEntry>>(new Map()).pipe(Atom.setIdleTTL(0))
 
   const rootErrorAtom = Atom.readable((get) => {
@@ -488,6 +506,9 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
       (args, get) =>
         Effect.gen(function*() {
           const state = get(stateAtom)
+          // A submit that settles after the form was initialized again must not
+          // write the previous session's results into the new one.
+          const isSameSession = captureSession(get)
           if (Option.isNone(state)) {
             return yield* Effect.die(
               new Error(
@@ -507,6 +528,7 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
             >,
             Effect.tapError((parseError) =>
               Effect.sync(() => {
+                if (!isSameSession()) return
                 const routedErrors = Validation.routeErrorsWithSource(parseError)
                 get.set(errorsAtom, routedErrors)
                 // Rebase onto the latest state so edits made during the in-flight
@@ -519,20 +541,25 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
           )
           // Rebase onto the latest state so a field edit made while the async
           // decode was running is not silently reverted to the pre-submit snapshot.
-          const latestState = get(stateAtom)
-          const baseState = Option.isSome(latestState) ? latestState.value : state.value
-          const submitState = operations.createSubmitState(baseState)
-          get.set(stateAtom, Option.some(submitState))
+          if (isSameSession()) {
+            const latestState = get(stateAtom)
+            const baseState = Option.isSome(latestState) ? latestState.value : state.value
+            get.set(stateAtom, Option.some(operations.createSubmitState(baseState)))
+          }
           const result = config.onSubmit(args, { decoded, encoded: values, get })
+          // A rejected Promise has no typed error channel, so it surfaces as a
+          // defect rather than being mistaken for a successful submit.
           const output = Effect.isEffect(result)
             ? yield* (result as Effect.Effect<A, E, R>)
+            : Predicate.isPromiseLike(result)
+            ? yield* Effect.promise(() => result as PromiseLike<A>)
             : (result as A)
           // Only record the values as "last submitted" once onSubmit has
           // succeeded. A failed onSubmit must not be reported as a successful
           // submit, otherwise revertToLastSubmit / hasChangedSinceSubmit would
           // treat unsaved, failed values as persisted.
           const afterSubmit = get(stateAtom)
-          if (Option.isSome(afterSubmit)) {
+          if (Option.isSome(afterSubmit) && isSameSession()) {
             get.set(
               stateAtom,
               Option.some({
@@ -552,6 +579,7 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
       (_: void, get) =>
         Effect.gen(function*() {
           const state = get(stateAtom)
+          const isSameSession = captureSession(get)
           if (Option.isNone(state)) return
           const values = state.value.values
           get.set(errorsAtom, new Map())
@@ -563,12 +591,13 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
             >,
             Effect.catchTag("SchemaError", (parseError) =>
               Effect.sync(() => {
+                if (!isSameSession()) return
                 const routedErrors = Validation.routeErrorsWithSource(parseError)
                 get.set(errorsAtom, routedErrors)
               }))
           )
           const currentState = get(stateAtom)
-          if (Option.isSome(currentState)) {
+          if (Option.isSome(currentState) && isSameSession()) {
             get.set(
               stateAtom,
               Option.some({
@@ -720,13 +749,31 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
     }
   }
 
+  const clearValidationResults = (get: Atom.FnContext) => {
+    get.set(errorsAtom, new Map())
+    resetValidationAtoms(get)
+  }
+
+  // Registry nodes outlive an unmount until a scheduled sweep, so a form that
+  // remounts in the same registry still holds the previous visit's validation
+  // results and subscriptions. Writing the fresh state through a batched
+  // fnSync lets those subscribers see a fully updated graph, and clearing the
+  // validation results drops anything computed against the old state.
+  const initializeAtom = Atom.fnSync<Field.EncodedFromFields<TFields>>()(
+    (defaultValues, get) => {
+      get.set(stateAtom, Option.some(operations.createInitialState(defaultValues)))
+      get.set(sessionIdAtom, ++lastSessionId)
+      clearValidationResults(get)
+    },
+    { initialValue: undefined as void }
+  ).pipe(Atom.setIdleTTL(0))
+
   const resetAtom = Atom.fnSync<void>()(
     (_: void, get) => {
       const state = get(stateAtom)
       if (Option.isNone(state)) return
       get.set(stateAtom, Option.some(operations.createResetState(state.value)))
-      get.set(errorsAtom, new Map())
-      resetValidationAtoms(get)
+      clearValidationResults(get)
       get.set(submitAtom, Atom.Reset)
       get.set(validateAtom, Atom.Reset)
     },
@@ -857,12 +904,17 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
         : Atom.debounce(submitRequestAtom, autoSubmitDebounce)
 
       return Atom.readable((get) => {
+        // Rebuild on every initialization so a node kept from a previous mount
+        // does not treat the newly initialized values as an edit to submit.
+        get(sessionIdAtom)
         const initialState = get.once(stateAtom)
         let lastValues: unknown = Option.isSome(initialState)
           ? initialState.value.values
           : null
         let pendingChanges = false
-        let wasSubmitting = false
+        // A rebuild can start while a submit is in flight, and its completion
+        // must still flush changes queued against this build.
+        let wasSubmitting = AsyncResult.isWaiting(get.once(submitAtom))
 
         const triggerSubmit = () => {
           if (AsyncResult.isWaiting(get.once(submitAtom))) {
@@ -876,9 +928,13 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
         if (debouncedSubmitRequestAtom === null) {
           requestSubmit = triggerSubmit
         } else {
+          // The debounce node outlives this build, so a timer started before the
+          // latest initialization can still land. Only requests made by this
+          // build may submit.
+          const baselineRequest = get.once(submitRequestAtom)
           get.mount(debouncedSubmitRequestAtom)
-          get.subscribe(debouncedSubmitRequestAtom, () => {
-            triggerSubmit()
+          get.subscribe(debouncedSubmitRequestAtom, (request) => {
+            if (request > baselineRequest) triggerSubmit()
           })
           requestSubmit = () => {
             get.set(submitRequestAtom, get.once(submitRequestAtom) + 1)
@@ -950,6 +1006,7 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E, SubmitArgs = v
     getOrCreateFieldAtoms,
     resetValidationAtoms,
     operations,
+    initializeAtom,
     resetAtom,
     revertToLastSubmitAtom,
     setValuesAtom,
