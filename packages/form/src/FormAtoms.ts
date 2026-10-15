@@ -1,5 +1,6 @@
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import { pipe } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Predicate from "effect/Predicate"
@@ -50,6 +51,18 @@ export interface FormAtomsConfig<TFields extends Field.FieldsRecord, R, A, E, Su
       readonly get: Atom.FnContext
     }
   ) => A | PromiseLike<A> | Effect.Effect<A, E, R>
+  /** Declare after `onSubmit`: TypeScript infers `E` left to right. */
+  readonly submitErrors?: (error: E) => ReadonlyArray<SubmitError<TFields>>
+}
+
+export interface SubmitError<TFields extends Field.FieldsRecord,> {
+  readonly path: Field.FieldPath<TFields>
+  readonly message: string
+}
+
+interface SubmitErrorEntry {
+  readonly message: string
+  readonly value: unknown
 }
 
 export type FieldRefs<TFields extends Field.FieldsRecord,> = {
@@ -67,6 +80,7 @@ export interface FormAtoms<TFields extends Field.FieldsRecord, R, A = void, E = 
   >
   readonly errorsAtom: Atom.Writable<Map<string, Validation.ErrorEntry>, Map<string, Validation.ErrorEntry>>
   readonly rootErrorAtom: Atom.Atom<Option.Option<string>>
+  readonly fieldErrorsAtom: Atom.Atom<ReadonlyMap<Field.FieldPath<TFields>, string>>
   readonly valuesAtom: Atom.Atom<Option.Option<Field.EncodedFromFields<TFields>>>
   readonly dirtyFieldsAtom: Atom.Atom<ReadonlySet<string>>
   readonly isDirtyAtom: Atom.Atom<boolean>
@@ -234,9 +248,13 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
 
   const errorsAtom = Atom.make<Map<string, Validation.ErrorEntry>>(new Map()).pipe(Atom.setIdleTTL(0))
 
+  const submitErrorsAtom = Atom.make<ReadonlyMap<string, SubmitErrorEntry>>(new Map()).pipe(Atom.setIdleTTL(0))
+
   const rootErrorAtom = Atom.readable((get) => {
-    const errors = get(errorsAtom)
-    const entry = errors.get("")
+    // Read both unconditionally, or an unread submit store gets swept.
+    const schemaEntry = get(errorsAtom).get("")
+    const submitEntry = get(submitErrorsAtom).get("")
+    const entry = schemaEntry ?? submitEntry
     return entry ? Option.some(entry.message) : Option.none<string>()
   }).pipe(Atom.setIdleTTL(0))
 
@@ -412,15 +430,18 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
 
       const livePerFieldError = Option.flatMap(AsyncResult.error(validationResult), Validation.extractFirstError)
 
+      // Read before branching, or an unread submit store gets swept.
+      const submitError = get(submitErrorsAtom).get(fieldPath)
+      const isStoredErrorShown = Option.isSome(storedError) && !(storedError.value.source === "field" &&
+        (AsyncResult.isSuccess(validationResult) || AsyncResult.isWaiting(validationResult)))
+
       let validationError: Option.Option<string> = Option.none()
       if (Option.isSome(livePerFieldError)) {
         validationError = livePerFieldError
-      } else if (Option.isSome(storedError)) {
-        const shouldHideStoredError = storedError.value.source === "field" &&
-          (AsyncResult.isSuccess(validationResult) || AsyncResult.isWaiting(validationResult))
-        if (!shouldHideStoredError) {
-          validationError = Option.some(storedError.value.message)
-        }
+      } else if (isStoredErrorShown) {
+        validationError = Option.map(storedError, (entry) => entry.message)
+      } else if (submitError !== undefined && Equal.equals(get(valueAtom), submitError.value)) {
+        validationError = Option.some(submitError.message)
       }
 
       const validationCount = get(validationCountAtom)
@@ -486,7 +507,10 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
     }
   })
 
+  // Reusing the key object skips structural hashing on every lookup.
   const getOrCreateFieldAtoms = (fieldPath: string, schema: Schema.Top): FieldAtoms => {
+    const recorded = fieldAtomsKeys.get(fieldPath)
+    if (recorded !== undefined && recorded.schema === schema) return fieldAtomsFamily(recorded)
     const key: FieldFamilyKey = { path: fieldPath, schema }
     fieldAtomsKeys.set(fieldPath, key)
     return fieldAtomsFamily(key)
@@ -499,6 +523,44 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
     for (const key of fieldAtomsKeys.values()) {
       ctx.set(fieldAtomsFamily(key).fieldValidationCountAtom, 0)
     }
+  }
+
+  const itemFieldDefsByArrayKey = new Map<string, ReadonlyArray<Field.FieldDef<string, Schema.Top>>>()
+  for (const [key, def] of Object.entries(fields)) {
+    if (!Field.isArrayFieldDef(def)) continue
+    const itemFieldDefs = Field.extractStructFieldDefs(def.itemSchema)
+    if (!itemFieldDefs) continue
+    itemFieldDefsByArrayKey.set(key, itemFieldDefs)
+  }
+
+  const ITEM_FIELD_PATH = /^(.*)\[(0|[1-9]\d*)\]\.([^.[\]]*)$/
+
+  const isSubmittedFieldPath = (path: string, values: Field.EncodedFromFields<TFields>): boolean => {
+    if (path === "" || Object.hasOwn(fields, path)) return true
+    const match = ITEM_FIELD_PATH.exec(path)
+    if (match === null) return false
+    const [, arrayKey, index, itemKey] = match as unknown as [string, string, string, string]
+    if (itemFieldDefsByArrayKey.get(arrayKey)?.some((itemDef) => itemDef.key === itemKey) !== true) return false
+    const items: unknown = getNestedValue(values, arrayKey)
+    return Array.isArray(items) && Number(index) < items.length
+  }
+
+  const toSubmitErrorEntries = (
+    errors: ReadonlyArray<SubmitError<TFields>>,
+    values: Field.EncodedFromFields<TFields>
+  ): ReadonlyMap<string, SubmitErrorEntry> => {
+    const entries = new Map<string, SubmitErrorEntry>()
+    for (const { message, path } of errors) {
+      if (!isSubmittedFieldPath(path, values)) {
+        throw new Error(
+          `submitErrors returned the path "${path}", which matches no field of the submitted form. ` +
+            `Use "" for the form-level error, a field name, or an array item path such as "items[0].name" ` +
+            "for an item that was submitted."
+        )
+      }
+      if (!entries.has(path)) entries.set(path, { message, value: getNestedValue(values, path) })
+    }
+    return entries
   }
 
   const submitAtom = runtime
@@ -520,6 +582,7 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
           }
           const values = state.value.values
           get.set(errorsAtom, new Map())
+          get.set(submitErrorsAtom, new Map())
           const decoded = yield* pipe(
             Schema.decodeUnknownEffect(combinedSchema)(values, { errors: "all" }) as Effect.Effect<
               Field.DecodedFromFields<TFields>,
@@ -549,8 +612,17 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
           const result = config.onSubmit(args, { decoded, encoded: values, get })
           // A rejected Promise has no typed error channel, so it surfaces as a
           // defect rather than being mistaken for a successful submit.
+          const { submitErrors } = config
           const output = Effect.isEffect(result)
-            ? yield* (result as Effect.Effect<A, E, R>)
+            ? yield* (submitErrors === undefined ? result as Effect.Effect<A, E, R> : pipe(
+              result as Effect.Effect<A, E, R>,
+              Effect.tapError((error) =>
+                Effect.sync(() => {
+                  const entries = toSubmitErrorEntries(submitErrors(error), values)
+                  if (isSameSession()) get.set(submitErrorsAtom, entries)
+                })
+              )
+            ))
             : Predicate.isPromiseLike(result)
             ? yield* Effect.promise(() => result as PromiseLike<A>)
             : (result as A)
@@ -751,7 +823,17 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
 
   const clearValidationResults = (get: Atom.FnContext) => {
     get.set(errorsAtom, new Map())
+    get.set(submitErrorsAtom, new Map())
     resetValidationAtoms(get)
+  }
+
+  const withoutRootSubmitError = (
+    submitErrors: ReadonlyMap<string, SubmitErrorEntry>
+  ): ReadonlyMap<string, SubmitErrorEntry> => {
+    if (!submitErrors.has("")) return submitErrors
+    const next = new Map(submitErrors)
+    next.delete("")
+    return next
   }
 
   // Registry nodes outlive an unmount until a scheduled sweep, so a form that
@@ -786,6 +868,7 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
       if (Option.isNone(state)) return
       get.set(stateAtom, Option.some(operations.revertToLastSubmit(state.value)))
       get.set(errorsAtom, new Map())
+      get.set(submitErrorsAtom, withoutRootSubmitError(get(submitErrorsAtom)))
     },
     { initialValue: undefined as void }
   ).pipe(Atom.setIdleTTL(0))
@@ -802,6 +885,7 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
       if (Option.isNone(state)) return
       ctx.set(stateAtom, Option.some(operations.setFormValues(state.value, values)))
       ctx.set(errorsAtom, new Map())
+      ctx.set(submitErrorsAtom, withoutRootSubmitError(ctx.get(submitErrorsAtom)))
     }
   ).pipe(Atom.setIdleTTL(0))
 
@@ -885,9 +969,32 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
   const getFieldAtoms = <S,>(field: FormBuilder.FieldRef<S>): PublicFieldAtoms<S> =>
     publicFieldAtomsFamily(field.key) as PublicFieldAtoms<S>
 
+  const fieldErrorsAtom = Atom.readable((get) => {
+    const fieldErrors = new Map<Field.FieldPath<TFields>, string>()
+    const state = get(stateAtom)
+    if (Option.isNone(state)) return fieldErrors
+    const addDisplayedError = (path: string, schema: Schema.Top) => {
+      const error = get(getOrCreateFieldAtoms(path, schema).displayErrorAtom)
+      if (Option.isSome(error)) fieldErrors.set(path as Field.FieldPath<TFields>, error.value)
+    }
+    for (const [key, schema] of fieldSchemasByKey) {
+      addDisplayedError(key, schema)
+      const itemFieldDefs = itemFieldDefsByArrayKey.get(key)
+      if (itemFieldDefs === undefined) continue
+      const items = getNestedValue(state.value.values, key) as ReadonlyArray<unknown> | undefined
+      for (let index = 0; index < (items?.length ?? 0); index++) {
+        for (const itemDef of itemFieldDefs) {
+          addDisplayedError(`${key}[${index}].${itemDef.key}`, itemDef.schema)
+        }
+      }
+    }
+    return fieldErrors
+  }).pipe(Atom.withEquality(Equal.equals), Atom.setIdleTTL(0))
+
   const mountAtom = Atom.readable((get) => {
     get(stateAtom)
     get(errorsAtom)
+    get(submitErrorsAtom)
     get(submitAtom)
   }).pipe(Atom.setIdleTTL(0))
 
@@ -990,6 +1097,7 @@ export const make = <TFields extends Field.FieldsRecord, R, A, E = never, Submit
     stateAtom,
     errorsAtom,
     rootErrorAtom,
+    fieldErrorsAtom,
     valuesAtom,
     dirtyFieldsAtom,
     isDirtyAtom,

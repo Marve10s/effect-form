@@ -55,6 +55,23 @@ export type DecodedFromFields<T extends FieldsRecord,> = {
     : never
 }
 
+// Follows the decoded side, like extractStructFieldDefs at runtime.
+type StructFieldsFromSchema<S,> = S extends Schema.Struct<infer Fields> ? Fields
+  : S extends Schema.suspend<infer Inner> ? StructFieldsFromSchema<Inner>
+  : S extends Schema.brand<infer Inner, any> ? StructFieldsFromSchema<Inner>
+  : S extends { readonly to: infer To } ? StructFieldsFromSchema<To>
+  : never
+
+type ArrayItemPaths<K extends string, S,> = [StructFieldsFromSchema<S>] extends [never] ? never
+  : `${K}[${number}].${Extract<keyof StructFieldsFromSchema<S>, string>}`
+
+export type FieldPath<TFields extends FieldsRecord,> =
+  | ""
+  | {
+    readonly [K in keyof TFields & string]: TFields[K] extends ArrayFieldDef<any, infer S> ? K | ArrayItemPaths<K, S>
+      : K
+  }[keyof TFields & string]
+
 export const getDefaultFromSchema = (schema: Schema.Top): unknown => {
   const ast = AST.toEncoded(schema.ast)
   switch (ast._tag) {
