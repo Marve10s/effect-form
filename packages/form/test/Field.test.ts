@@ -83,6 +83,32 @@ describe("Field", () => {
       expect(defs![1]!.key).toBe("age")
     })
 
+    it("rejects an item schema that renames keys on decode", () => {
+      const renamed = Schema.Struct({ full_name: Schema.String }).pipe(
+        Schema.decodeTo(Schema.Struct({ name: Schema.String }), {
+          decode: SchemaGetter.transform((e: { readonly full_name: string }) => ({ name: e.full_name })),
+          encode: SchemaGetter.transform((d: { readonly name: string }) => ({ full_name: d.name }))
+        })
+      )
+      expect(() => Field.extractStructFieldDefs(renamed)).toThrow(
+        "Every decoded key of an array item must also be an encoded key, but the encoded keys are [full_name] and the decoded keys are [name]."
+      )
+    })
+
+    it("rejects an item schema built with encodeKeys", () => {
+      const renamed = Schema.Struct({ name: Schema.String }).pipe(Schema.encodeKeys({ name: "full_name" }))
+      expect(() => Field.extractStructFieldDefs(renamed)).toThrow(
+        "Every decoded key of an array item must also be an encoded key, but the encoded keys are [full_name] and the decoded keys are [name]."
+      )
+    })
+
+    it("rejects an item schema that is not a struct when encoded", () => {
+      const fromJson = Schema.fromJsonString(Schema.Struct({ name: Schema.String }))
+      expect(() => Field.extractStructFieldDefs(fromJson)).toThrow(
+        "Every decoded key of an array item must also be an encoded key, but the encoded item is not a struct and the decoded keys are [name]."
+      )
+    })
+
     it("unwraps refinements, transformations, and suspends", () => {
       const base = Schema.Struct({ name: Schema.String, age: Schema.Number })
       const refined = base.pipe(Schema.check(Schema.makeFilter(() => true)))
