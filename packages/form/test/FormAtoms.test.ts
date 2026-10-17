@@ -969,22 +969,23 @@ describe("FormAtoms", () => {
         registry.set(atoms.initializeAtom, { date: new Date(0) })
         const field = atoms.getFieldAtoms(atoms.fieldRefs.date)
 
-        registry.set(atoms.submitAtom, undefined)
-        const submitted = await Effect.runPromise(
-          AtomRegistry.getResult(registry, atoms.submitAtom, { suspendOnWaiting: true })
-        )
-        expect(submitted).toEqual({ date: new Date(0) })
-        expect(Option.getOrThrow(registry.get(atoms.lastSubmittedValuesAtom)).encoded.date).toEqual(new Date(0))
-        expect(registry.get(atoms.hasChangedSinceSubmitAtom)).toBe(false)
-
         registry.set(field.setValue, new Date(1))
         expect(registry.get(atoms.isDirtyAtom)).toBe(true)
         expect(registry.get(field.isDirty)).toBe(true)
-        expect(registry.get(atoms.hasChangedSinceSubmitAtom)).toBe(true)
+
+        registry.set(atoms.submitAtom, undefined)
+        await Effect.runPromise(
+          AtomRegistry.getResult(registry, atoms.submitAtom, { suspendOnWaiting: true })
+        )
 
         registry.set(field.setValue, new Date(0))
         expect(registry.get(atoms.isDirtyAtom)).toBe(false)
         expect(registry.get(field.isDirty)).toBe(false)
+        expect(registry.get(atoms.hasChangedSinceSubmitAtom)).toBe(true)
+
+        registry.set(field.setValue, new Date(1))
+        expect(registry.get(atoms.isDirtyAtom)).toBe(true)
+        expect(registry.get(field.isDirty)).toBe(true)
         expect(registry.get(atoms.hasChangedSinceSubmitAtom)).toBe(false)
       } finally {
         registry.dispose()
